@@ -74,10 +74,9 @@ export default function StudentsPage() {
     setImporting(true);
     const supabase = createClient();
     let success = 0;
-    let dup = 0;
     for (const row of validRows) {
       const classroom = classrooms.find(c => c.grade === parseInt(row.grade) && c.section === row.section);
-      const { error } = await supabase.from('students').insert({
+      const { error } = await supabase.from('students').upsert({
         school_id: schoolId,
         student_code: row.student_code,
         first_name: row.first_name,
@@ -85,13 +84,11 @@ export default function StudentsPage() {
         gender: row.gender || null,
         classroom_id: classroom?.id || null,
         parent_contact: row.parent_contact || null,
-      });
+        is_active: true,
+      }, { onConflict: 'school_id,student_code' });
       if (!error) success++;
-      else if (error.message.includes('unique')) dup++;
     }
-    let msg = `นำเข้าสำเร็จ ${success} คน`;
-    if (dup > 0) msg += ` (ซ้ำ ${dup} คน)`;
-    toast.success(msg);
+    toast.success(`นำเข้า/อัพเดต ${success} คน`);
     setPasteText('');
     setPasteRows([]);
     setShowPaste(false);
@@ -104,14 +101,19 @@ export default function StudentsPage() {
     if (!schoolId) { toast.error('กรุณาตั้งค่าข้อมูลโรงเรียนก่อน'); return; }
     setLoading(true);
     const supabase = createClient();
-    const { error } = await supabase.from('students').insert({
-      ...form, school_id: schoolId,
+    const { error } = await supabase.from('students').upsert({
+      school_id: schoolId,
+      student_code: form.student_code,
+      first_name: form.first_name,
+      last_name: form.last_name,
       gender: form.gender || null,
       classroom_id: form.classroom_id || null,
-    });
-    if (error) toast.error(error.message.includes('unique') ? 'รหัสนักเรียนซ้ำ' : 'เกิดข้อผิดพลาด');
+      parent_contact: form.parent_contact || null,
+      is_active: true,
+    }, { onConflict: 'school_id,student_code' });
+    if (error) toast.error('เกิดข้อผิดพลาด: ' + error.message);
     else {
-      toast.success('เพิ่มนักเรียนสำเร็จ');
+      toast.success('บันทึกสำเร็จ');
       setShowForm(false);
       setForm({ student_code: '', first_name: '', last_name: '', gender: '', classroom_id: '', parent_contact: '' });
       load();
