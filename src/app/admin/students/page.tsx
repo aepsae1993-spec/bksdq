@@ -3,17 +3,31 @@ import { useEffect, useState, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import toast from 'react-hot-toast';
 import type { Student, Classroom } from '@/types';
-import Papa from 'papaparse';
 
 const GENDER_LABEL: Record<string, string> = { M: 'ชาย', F: 'หญิง' };
+
+interface PasteRow {
+  student_code: string;
+  first_name: string;
+  last_name: string;
+  gender: string;
+  grade: string;
+  section: string;
+  parent_contact: string;
+  _error?: string;
+}
 
 export default function StudentsPage() {
   const [students, setStudents] = useState<Student[]>([]);
   const [classrooms, setClassrooms] = useState<Classroom[]>([]);
   const [schoolId, setSchoolId] = useState('');
   const [showForm, setShowForm] = useState(false);
-  const [filter, setFilter] = useState({ grade: '', section: '', search: '' });
+  const [showPaste, setShowPaste] = useState(false);
+  const [filter, setFilter] = useState({ grade: '', search: '' });
   const [form, setForm] = useState({ student_code: '', first_name: '', last_name: '', gender: '', classroom_id: '', parent_contact: '' });
+  const [pasteText, setPasteText] = useState('');
+  const [pasteRows, setPasteRows] = useState<PasteRow[]>([]);
+  const [importing, setImporting] = useState(false);
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(async () => {
@@ -30,14 +44,78 @@ export default function StudentsPage() {
 
   useEffect(() => { load(); }, [load]);
 
+  // Parse paste text (tab-separated from Excel)
+  function parsePaste(text: string): PasteRow[] {
+    const lines = text.trim().split('\n').filter(l => l.trim());
+    return lines.map(line => {
+      const cols = line.split('\t').map(c => c.trim().replace(/\r/g, ''));
+      // Expected columns: รหัสนักเรียน | ชื่อ | นามสกุล | เพศ(ช/ห หรือ M/F) | ชั้น(1-6) | ห้อง | เบอร์ผู้ปกครอง
+      const [student_code = '', first_name = '', last_name = '', gender_raw = '', grade = '', section = '', parent_contact = ''] = cols;
+      const gender = gender_raw === 'ช' || gender_raw.toUpperCase() === 'M' ? 'M'
+        : gender_raw === 'ห' || gender_raw.toUpperCase() === 'F' ? 'F' : '';
+      let error = '';
+      if (!student_code) error = 'ไม่มีรหัสนักเรียน';
+      else if (!first_name) error = 'ไม่มีชื่อ';
+      else if (!grade || isNaN(parseInt(grade)) || parseInt(grade) < 1 || parseInt(grade) > 6) error = 'ชั้นไม่ถูกต้อง';
+      return { student_code, first_name, last_name, gender, grade, section, parent_contact, _error: error };
+    });
+  }
+
+  function handlePasteChange(text: string) {
+    setPasteText(text);
+    if (text.trim()) setPasteRows(parsePaste(text));
+    else setPasteRows([]);
+  }
+
+  async function handleImport() {
+    const validRows = pasteRows.filter(r => !r._error);
+    if (validRows.length === 0) { toast.error('ไม่มีข้อมูลที่ถูกต้อง'); return; }
+    if (!schoolId) { toast.error('กรุณาตั้งค่าข้อมูลโรงเรียนก่อน'); return; }
+    setImporting(true);
+    const supabase = createClient();
+    let success = 0;
+    let dup = 0;
+    for (const row of validRows) {
+      const classroom = classrooms.find(c => c.grade === parseInt(row.grade) && c.section === row.section);
+      const { error } = await supabase.from('students').insert({
+        school_id: schoolId,
+        student_code: row.student_code,
+        first_name: row.first_name,
+        last_name: row.last_name,
+        gender: row.gender || null,
+        classroom_id: classroom?.id || null,
+        parent_contact: row.parent_contact || null,
+      });
+      if (!error) success++;
+      else if (error.message.includes('unique')) dup++;
+    }
+    let msg = `นำเข้าสำเร็จ ${success} คน`;
+    if (dup > 0) msg += ` (ซ้ำ ${dup} คน)`;
+    toast.success(msg);
+    setPasteText('');
+    setPasteRows([]);
+    setShowPaste(false);
+    load();
+    setImporting(false);
+  }
+
   async function handleAdd(e: React.FormEvent) {
     e.preventDefault();
     if (!schoolId) { toast.error('กรุณาตั้งค่าข้อมูลโรงเรียนก่อน'); return; }
     setLoading(true);
     const supabase = createClient();
-    const { error } = await supabase.from('students').insert({ ...form, school_id: schoolId, gender: form.gender || null, classroom_id: form.classroom_id || null });
+    const { error } = await supabase.from('students').insert({
+      ...form, school_id: schoolId,
+      gender: form.gender || null,
+      classroom_id: form.classroom_id || null,
+    });
     if (error) toast.error(error.message.includes('unique') ? 'รหัสนักเรียนซ้ำ' : 'เกิดข้อผิดพลาด');
-    else { toast.success('เพิ่มนักเรียนสำเร็จ'); setShowForm(false); setForm({ student_code: '', first_name: '', last_name: '', gender: '', classroom_id: '', parent_contact: '' }); load(); }
+    else {
+      toast.success('เพิ่มนักเรียนสำเร็จ');
+      setShowForm(false);
+      setForm({ student_code: '', first_name: '', last_name: '', gender: '', classroom_id: '', parent_contact: '' });
+      load();
+    }
     setLoading(false);
   }
 
@@ -49,46 +127,18 @@ export default function StudentsPage() {
     load();
   }
 
-  function handleCSVImport(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file || !schoolId) return;
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      complete: async (results) => {
-        const supabase = createClient();
-        const rows = results.data as Record<string, string>[];
-        let success = 0;
-        for (const row of rows) {
-          const classroom = classrooms.find(c => c.grade === parseInt(row.grade) && c.section === row.section);
-          const { error } = await supabase.from('students').insert({
-            school_id: schoolId,
-            student_code: row.student_code,
-            first_name: row.first_name,
-            last_name: row.last_name,
-            gender: row.gender || null,
-            classroom_id: classroom?.id || null,
-            parent_contact: row.parent_contact || null,
-          });
-          if (!error) success++;
-        }
-        toast.success(`นำเข้าสำเร็จ ${success}/${rows.length} คน`);
-        load();
-      },
-    });
-    e.target.value = '';
-  }
-
   const filtered = students.filter(s => {
     const c = s.classroom as unknown as Classroom;
     if (filter.grade && String(c?.grade) !== filter.grade) return false;
-    if (filter.section && c?.section !== filter.section) return false;
     if (filter.search) {
       const q = filter.search.toLowerCase();
       return s.first_name.toLowerCase().includes(q) || s.last_name.toLowerCase().includes(q) || s.student_code.toLowerCase().includes(q);
     }
     return true;
   });
+
+  const validCount = pasteRows.filter(r => !r._error).length;
+  const errorCount = pasteRows.filter(r => r._error).length;
 
   return (
     <div className="p-8">
@@ -98,14 +148,91 @@ export default function StudentsPage() {
           <p className="text-gray-500 mt-1">จัดการข้อมูลนักเรียนทั้งหมด ({students.length} คน)</p>
         </div>
         <div className="flex gap-2">
-          <label className="btn-secondary cursor-pointer text-sm">
-            📥 นำเข้า CSV
-            <input type="file" accept=".csv" className="hidden" onChange={handleCSVImport} />
-          </label>
-          <button onClick={() => setShowForm(!showForm)} className="btn-primary">+ เพิ่มนักเรียน</button>
+          <button onClick={() => { setShowPaste(!showPaste); setShowForm(false); }} className="btn-secondary text-sm">
+            📋 วางข้อมูลจาก Excel
+          </button>
+          <button onClick={() => { setShowForm(!showForm); setShowPaste(false); }} className="btn-primary">
+            + เพิ่มนักเรียน
+          </button>
         </div>
       </div>
 
+      {/* Paste from Excel */}
+      {showPaste && (
+        <div className="card mb-6">
+          <h2 className="font-bold text-gray-900 mb-1">วางข้อมูลจาก Excel</h2>
+          <p className="text-sm text-gray-500 mb-3">
+            คัดลอกข้อมูลจาก Excel แล้ววางที่นี่ (ไม่ต้องมี header)
+          </p>
+
+          {/* Column guide */}
+          <div className="bg-gray-50 rounded-lg p-3 mb-3 text-xs font-mono overflow-x-auto">
+            <div className="text-gray-400 mb-1">ลำดับคอลัมน์ใน Excel (A → G):</div>
+            <div className="grid grid-cols-7 gap-1 text-center">
+              {['A: รหัสนักเรียน', 'B: ชื่อ', 'C: นามสกุล', 'D: เพศ (ช/ห หรือ M/F)', 'E: ชั้น (1-6)', 'F: ห้อง', 'G: เบอร์ผู้ปกครอง'].map(h => (
+                <div key={h} className="bg-blue-100 text-blue-800 rounded px-1 py-1 leading-tight">{h}</div>
+              ))}
+            </div>
+            <div className="text-gray-400 mt-2">ตัวอย่าง:</div>
+            <div className="text-gray-700">P101001{'  '}สมชาย{'  '}ใจดี{'  '}ช{'  '}1{'  '}1{'  '}0812345678</div>
+          </div>
+
+          <textarea
+            className="input font-mono text-sm h-48 resize-y"
+            placeholder="วางข้อมูลจาก Excel ที่นี่..."
+            value={pasteText}
+            onChange={e => handlePasteChange(e.target.value)}
+          />
+
+          {/* Preview */}
+          {pasteRows.length > 0 && (
+            <div className="mt-3">
+              <div className="flex items-center gap-3 mb-2 text-sm">
+                <span className="text-green-700 font-medium">✓ ถูกต้อง {validCount} แถว</span>
+                {errorCount > 0 && <span className="text-red-600 font-medium">✕ มีข้อผิดพลาด {errorCount} แถว</span>}
+              </div>
+              <div className="max-h-48 overflow-y-auto border rounded-lg">
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50 sticky top-0">
+                    <tr>
+                      <th className="text-left px-3 py-2">รหัส</th>
+                      <th className="text-left px-3 py-2">ชื่อ-นามสกุล</th>
+                      <th className="text-left px-3 py-2">เพศ</th>
+                      <th className="text-left px-3 py-2">ชั้น/ห้อง</th>
+                      <th className="text-left px-3 py-2">เบอร์</th>
+                      <th className="text-left px-3 py-2">สถานะ</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {pasteRows.map((r, i) => (
+                      <tr key={i} className={r._error ? 'bg-red-50' : 'bg-white'}>
+                        <td className="px-3 py-1.5 font-mono">{r.student_code || '-'}</td>
+                        <td className="px-3 py-1.5">{r.first_name} {r.last_name}</td>
+                        <td className="px-3 py-1.5">{r.gender === 'M' ? 'ชาย' : r.gender === 'F' ? 'หญิง' : '-'}</td>
+                        <td className="px-3 py-1.5">ป.{r.grade}/{r.section}</td>
+                        <td className="px-3 py-1.5">{r.parent_contact || '-'}</td>
+                        <td className="px-3 py-1.5">
+                          {r._error
+                            ? <span className="text-red-600">⚠ {r._error}</span>
+                            : <span className="text-green-600">✓ โอเค</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="flex gap-2 mt-3">
+                <button onClick={handleImport} disabled={importing || validCount === 0} className="btn-primary">
+                  {importing ? 'กำลังนำเข้า...' : `📥 นำเข้า ${validCount} คน`}
+                </button>
+                <button onClick={() => { setPasteText(''); setPasteRows([]); }} className="btn-secondary">ล้างข้อมูล</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Add single student form */}
       {showForm && (
         <div className="card mb-6 max-w-lg">
           <h2 className="font-bold mb-4">เพิ่มนักเรียนใหม่</h2>
@@ -154,13 +281,6 @@ export default function StudentsPage() {
           </form>
         </div>
       )}
-
-      {/* CSV Template hint */}
-      <div className="card mb-4 bg-blue-50 border-blue-100">
-        <p className="text-sm text-blue-800">
-          <strong>รูปแบบ CSV:</strong> student_code, first_name, last_name, gender (M/F), grade (1-6), section, parent_contact
-        </p>
-      </div>
 
       {/* Filters */}
       <div className="flex gap-3 mb-4">
